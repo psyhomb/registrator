@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"bytes"
 	"errors"
 	"log"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"text/template"
 
 	dockerapi "github.com/fsouza/go-dockerclient"
 )
@@ -202,7 +204,7 @@ func (b *Bridge) add(containerId string, quiet bool) {
 
 	// Extract configured host port mappings, relevant when using --net=host
 	for port, _ := range container.Config.ExposedPorts {
-		published := []dockerapi.PortBinding{ {"0.0.0.0", port.Port()}, }
+		published := []dockerapi.PortBinding{{"0.0.0.0", port.Port()}}
 		ports[string(port)] = servicePort(container, port, published)
 	}
 
@@ -309,7 +311,7 @@ func (b *Bridge) newService(port ServicePort, isgroup bool) *Service {
 				service.IP = containerIp
 			}
 			log.Println("using container IP " + service.IP + " from label '" +
-				b.config.UseIpFromLabel  + "'")
+				b.config.UseIpFromLabel + "'")
 		} else {
 			log.Println("Label '" + b.config.UseIpFromLabel +
 				"' not found in container configuration")
@@ -332,13 +334,138 @@ func (b *Bridge) newService(port ServicePort, isgroup bool) *Service {
 		}
 	}
 
+	// Use container inspect data to populate tags list
+	// https://github.com/fsouza/go-dockerclient/blob/master/container.go#L441-L483
+	ForceTags := b.config.ForceTags
+	if len(ForceTags) != 0 {
+		// Template functions
+		fm := template.FuncMap{
+			// Slice function
+			"slice": func(v string, i ...int) string {
+				if len(i) == 1 {
+					if len(v) >= i[0] {
+						return v[i[0]:]
+					}
+				}
+
+				if len(i) == 2 {
+					if len(v) >= i[0] && len(v) >= i[1] {
+						if i[0] == 0 {
+							return v[:i[1]]
+						}
+						if i[1] < i[0] {
+							return v[i[0]:]
+						}
+						return v[i[0]:i[1]]
+					}
+				}
+
+				return v
+			},
+			// sIndex function
+			"sIndex": func(s []string, i int) string {
+				if i < 0 {
+					i = i * -1
+					if i >= len(s) {
+						return s[0]
+					}
+					return s[len(s)-i]
+				}
+
+				if i >= len(s) {
+					return s[len(s)-1]
+				}
+
+				return s[i]
+			},
+			// mIndex function
+			"mIndex": func(m map[string]string, k string) string {
+				return m[k]
+			},
+			// toUpper function
+			"toUpper": func(v string) string {
+				return strings.ToUpper(v)
+			},
+			// toLower function
+			"toLower": func(v string) string {
+				return strings.ToLower(v)
+			},
+			// join function
+			"join": func(s []string, sep string) string {
+				return strings.Join(s, sep)
+			},
+			// split function
+			"split": func(v, sep string) []string {
+				return strings.Split(v, sep)
+			},
+			// splitIndex function
+			"splitIndex": func(v, sep string, i int) string {
+				l := strings.Split(v, sep)
+
+				if i < 0 {
+					i = i * -1
+					if i >= len(l) {
+						return l[0]
+					}
+					return l[len(l)-i]
+				}
+
+				if i >= len(l) {
+					return l[len(l)-1]
+				}
+
+				return l[i]
+			},
+			// matchFirstElement function
+			"matchFirstElement": func(s []string, r string) string {
+				var m string
+
+				re := regexp.MustCompile(r)
+				for _, e := range s {
+					if re.MatchString(e) {
+						m = e
+						break
+					}
+				}
+
+				return m
+			},
+			// matchAllElements function
+			"matchAllElements": func(s []string, r string) []string {
+				var m []string
+
+				re := regexp.MustCompile(r)
+				for _, e := range s {
+					if re.MatchString(e) {
+						m = append(m, e)
+					}
+				}
+
+				return m
+			},
+		}
+
+		tmpl, err := template.New("tags").Funcs(fm).Parse(ForceTags)
+		if err != nil {
+			log.Fatalf("%s template parsing failed with error: %s", ForceTags, err)
+		}
+
+		var b bytes.Buffer
+		err = tmpl.Execute(&b, container)
+		if err != nil {
+			log.Fatalf("%s template execution failed with error: %s", ForceTags, err)
+		}
+
+		ForceTags = b.String()
+	}
+
 	if port.PortType == "udp" {
 		service.Tags = combineTags(
-			mapDefault(metadata, "tags", ""), b.config.ForceTags, "udp")
+			mapDefault(metadata, "tags", ""), ForceTags, "udp")
 		service.ID = service.ID + ":udp"
 	} else {
 		service.Tags = combineTags(
-			mapDefault(metadata, "tags", ""), b.config.ForceTags)
+			mapDefault(metadata, "tags", ""), ForceTags)
 	}
 
 	id := mapDefault(metadata, "id", "")
